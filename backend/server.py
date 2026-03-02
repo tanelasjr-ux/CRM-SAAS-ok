@@ -1,8 +1,8 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 from datetime import datetime, timezone, timedelta
 import uuid
 import os
@@ -11,6 +11,7 @@ import hashlib
 import httpx
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from postgrest.exceptions import APIError
 
 load_dotenv()
 
@@ -23,10 +24,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 72
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # opcional
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise Exception("SUPABASE_URL ou SUPABASE_SERVICE_KEY não configurados")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-app = FastAPI(title="Automation CRM API", version="3.0.0")
+app = FastAPI(title="Automation CRM API", version="4.0.0")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -51,7 +57,10 @@ def decode_token(token: str):
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    return decode_token(credentials.credentials)
+    try:
+        return decode_token(credentials.credentials)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token inválido")
 
 # ========================
 # MODELS
@@ -71,6 +80,8 @@ class LeadCreate(BaseModel):
 class ActivityCreate(BaseModel):
     lead_id: str
     description: str
+    type: str = "manual"
+    is_completed: bool = True
 
 class MoveLeadRequest(BaseModel):
     stage_id: str
@@ -104,10 +115,7 @@ async def login(request: LoginRequest):
         "role": user["role"]
     })
 
-    return {
-        "access_token": token,
-        "user": user
-    }
+    return {"access_token": token, "user": user}
 
 # ========================
 # PIPELINE
@@ -115,11 +123,13 @@ async def login(request: LoginRequest):
 
 @api_router.get("/pipeline-stages")
 async def get_pipeline(current_user: dict = Depends(get_current_user)):
+
     result = supabase.table("pipeline_stages") \
         .select("*") \
         .eq("tenant_id", current_user["tenant_id"]) \
         .order("order") \
         .execute()
+
     return result.data or []
 
 # ========================
@@ -128,11 +138,13 @@ async def get_pipeline(current_user: dict = Depends(get_current_user)):
 
 @api_router.get("/leads")
 async def get_leads(current_user: dict = Depends(get_current_user)):
+
     result = supabase.table("leads") \
         .select("*") \
         .eq("tenant_id", current_user["tenant_id"]) \
         .order("created_at", desc=True) \
         .execute()
+
     return result.data or []
 
 @api_router.post("/leads")
@@ -168,6 +180,9 @@ async def move_lead(lead_id: str, request: MoveLeadRequest, current_user: dict =
         .eq("tenant_id", current_user["tenant_id"]) \
         .execute()
 
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Lead não encontrado")
+
     return result.data[0]
 
 # ========================
@@ -182,6 +197,8 @@ async def create_activity(activity: ActivityCreate, current_user: dict = Depends
         "tenant_id": current_user["tenant_id"],
         "lead_id": activity.lead_id,
         "description": activity.description,
+        "type": activity.type,
+        "is_completed": activity.is_completed,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -201,7 +218,7 @@ async def get_activities(lead_id: str, current_user: dict = Depends(get_current_
     return result.data or []
 
 # ========================
-# WHATSAPP (MANUAL SEND)
+# WHATSAPP ENVIO
 # ========================
 
 @api_router.post("/whatsapp/send")
@@ -217,10 +234,9 @@ async def send_message(lead_id: str, message: str, current_user: dict = Depends(
 
     phone = lead.data[0]["phone"]
 
-    # Envia para N8N webhook
     async with httpx.AsyncClient() as client:
         await client.post(
-            os.getenv("N8N_WEBHOOK_URL"),
+            N8N_WEBHOOK_URL,
             json={
                 "tenant_id": current_user["tenant_id"],
                 "phone": phone,
@@ -231,13 +247,18 @@ async def send_message(lead_id: str, message: str, current_user: dict = Depends(
     return {"success": True}
 
 # ========================
-# WEBHOOK RECEBIMENTO DO N8N
+# WEBHOOK RECEBIMENTO
 # ========================
 
 @api_router.post("/webhook/whatsapp")
-async def receive_message(data: WebhookMessage):
+async def receive_message(request: Request, data: WebhookMessage):
 
-    # encontra lead pelo telefone
+    # valida token opcional
+    if WEBHOOK_SECRET:
+        token = request.headers.get("x-webhook-secret")
+        if token != WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="Webhook não autorizado")
+
     lead = supabase.table("leads") \
         .select("*") \
         .eq("phone", data.phone) \
@@ -245,7 +266,6 @@ async def receive_message(data: WebhookMessage):
         .execute()
 
     if not lead.data:
-        # cria lead automaticamente
         new_lead = {
             "id": str(uuid.uuid4()),
             "tenant_id": data.tenant_id,
@@ -258,12 +278,14 @@ async def receive_message(data: WebhookMessage):
     else:
         lead_id = lead.data[0]["id"]
 
-    # salva atividade
+    # salva activity CORRIGIDO
     supabase.table("activities").insert({
         "id": str(uuid.uuid4()),
         "tenant_id": data.tenant_id,
         "lead_id": lead_id,
         "description": f"Mensagem recebida: {data.message}",
+        "type": "whatsapp_incoming",
+        "is_completed": True,
         "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
 

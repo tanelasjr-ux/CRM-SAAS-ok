@@ -11,7 +11,6 @@ import hashlib
 import httpx
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from postgrest.exceptions import APIError
 
 load_dotenv()
 
@@ -25,14 +24,14 @@ JWT_SECRET = os.getenv("JWT_SECRET", "super-secret")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 72
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # opcional
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise Exception("SUPABASE_URL ou SUPABASE_SERVICE_KEY não configurados")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-app = FastAPI(title="Automation CRM API", version="4.0.0")
+app = FastAPI(title="Automation CRM API", version="5.0.0")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -116,6 +115,36 @@ async def login(request: LoginRequest):
     })
 
     return {"access_token": token, "user": user}
+
+
+@api_router.get("/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    return current_user
+
+
+# ========================
+# DASHBOARD
+# ========================
+
+@api_router.get("/dashboard/stats")
+async def dashboard_stats(current_user: dict = Depends(get_current_user)):
+
+    leads = supabase.table("leads") \
+        .select("id", count="exact") \
+        .eq("tenant_id", current_user["tenant_id"]) \
+        .execute()
+
+    activities = supabase.table("activities") \
+        .select("id", count="exact") \
+        .eq("tenant_id", current_user["tenant_id"]) \
+        .execute()
+
+    return {
+        "total_leads": leads.count or 0,
+        "total_activities": activities.count or 0,
+        "total_revenue": 0,
+        "conversion_rate": 0
+    }
 
 # ========================
 # PIPELINE
@@ -234,6 +263,17 @@ async def send_message(lead_id: str, message: str, current_user: dict = Depends(
 
     phone = lead.data[0]["phone"]
 
+    # salva outgoing
+    supabase.table("activities").insert({
+        "id": str(uuid.uuid4()),
+        "tenant_id": current_user["tenant_id"],
+        "lead_id": lead_id,
+        "description": f"Mensagem enviada: {message}",
+        "type": "whatsapp_outgoing",
+        "is_completed": True,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
     async with httpx.AsyncClient() as client:
         await client.post(
             N8N_WEBHOOK_URL,
@@ -253,7 +293,6 @@ async def send_message(lead_id: str, message: str, current_user: dict = Depends(
 @api_router.post("/webhook/whatsapp")
 async def receive_message(request: Request, data: WebhookMessage):
 
-    # valida token opcional
     if WEBHOOK_SECRET:
         token = request.headers.get("x-webhook-secret")
         if token != WEBHOOK_SECRET:
@@ -278,7 +317,6 @@ async def receive_message(request: Request, data: WebhookMessage):
     else:
         lead_id = lead.data[0]["id"]
 
-    # salva activity CORRIGIDO
     supabase.table("activities").insert({
         "id": str(uuid.uuid4()),
         "tenant_id": data.tenant_id,
